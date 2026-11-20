@@ -47,6 +47,7 @@ registry (https://standards-oui.ieee.org/oui/oui.txt) for full coverage.
 
 import argparse
 import csv
+import ipaddress
 import json
 import struct
 import sys
@@ -85,12 +86,39 @@ IT_RISK_PORTS = {
     21: "FTP", 23: "Telnet", 80: "HTTP", 135: "MSRPC", 139: "NetBIOS",
     445: "SMB", 3389: "RDP", 5900: "VNC", 161: "SNMP", 22: "SSH", 443: "HTTPS",
 }
+# Services that make a host look like a Windows/IT server or workstation.
+HOST_IT_PORTS = {135, 139, 445, 3389, 5900}
+# Management services that PLCs, RTUs, gateways and switches commonly run themselves.
+# They are worth flagging (cleartext management), but they do not make a field device "IT".
+EMBEDDED_MGMT_PORTS = {21: "FTP", 22: "SSH", 23: "Telnet", 80: "HTTP", 443: "HTTPS", 161: "SNMP"}
+CLEARTEXT_MGMT_PORTS = {21: "FTP", 23: "Telnet", 80: "HTTP", 161: "SNMP"}
+
 ETHERTYPE_PROTOCOLS = {
     0x8892: "PROFINET", 0x88A4: "EtherCAT", 0x88B8: "IEC 61850 GOOSE",
     0x88BA: "IEC 61850 Sampled Values", 0x88F7: "PTP (L2)",
 }
 
 DEFAULT_OUI_DB_PATH = Path(__file__).parent / "oui_vendors.json"
+
+
+def ip_kind(ip):
+    """'internal', 'external', or 'skip' (broadcast, multicast, unspecified, invalid)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return "skip"
+    if a.is_multicast or a.is_unspecified or a.is_reserved or str(a) == "255.255.255.255":
+        return "skip"
+    if a.is_loopback or a.is_link_local:
+        return "skip"
+    return "internal" if a.is_private else "external"
+
+
+def subnet24(ip):
+    try:
+        return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+    except ValueError:
+        return None
 
 
 def now_iso():
@@ -138,6 +166,8 @@ class DeviceRecord:
         self.ot_dest_count = 0     # times this IP was the destination of OT protocol traffic
         self.ot_src_count = 0      # times this IP originated OT protocol traffic
         self.peers = set()        # other IPs this device communicated with (OT context)
+        self.external_peers = set()  # internet addresses this device talked to
+        self.routed = False          # only seen through a router, so its own MAC is unknown
 
     def touch(self, ts):
         if ts is None:
@@ -148,9 +178,22 @@ class DeviceRecord:
             self.last_seen = ts
 
 
+BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+
+
+def is_group_mac(mac):
+    # multicast/broadcast MACs have the least-significant bit of the first octet set
+    try:
+        return bool(int(mac.split(":")[0], 16) & 1)
+    except (ValueError, AttributeError, IndexError):
+        return False
+
+
 def analyze_pcap(path):
-    devices = defaultdict(DeviceRecord)   # keyed by IP
+    devices = defaultdict(DeviceRecord)   # keyed by internal IP
     l2_only = defaultdict(DeviceRecord)   # keyed by MAC, for non-IP ethertype protocols
+    external = defaultdict(lambda: {"internal_peers": set(), "ports": set(), "packets": 0})
+    mac_ips = defaultdict(set)            # MAC -> internal IPs it carried (more than one = router)
     packets = rdpcap(path)
 
     for pkt in packets:
@@ -176,12 +219,31 @@ def analyze_pcap(path):
         sport = pkt[TCP].sport if TCP in pkt else (pkt[UDP].sport if UDP in pkt else None)
         dport = pkt[TCP].dport if TCP in pkt else (pkt[UDP].dport if UDP in pkt else None)
 
+        kinds = {src: ip_kind(src), dst: ip_kind(dst)}
+        # a subnet broadcast (e.g. 10.10.20.255) shows up with a broadcast destination MAC
+        if dst_mac and is_group_mac(dst_mac):
+            kinds[dst] = "skip"
+
         for ip, mac in ((src, src_mac), (dst, dst_mac)):
+            if mac and not is_group_mac(mac) and kinds[ip] != "skip":
+                mac_ips[mac.lower()].add(ip)   # internet IPs count too: they reveal the router MAC
+            if kinds[ip] != "internal":
+                continue
             rec = devices[ip]
-            if mac:
+            if mac and not is_group_mac(mac):
                 rec.macs.add(mac)
             rec.packet_count += 1
             rec.touch(ts)
+
+        # remember internet-facing conversations instead of listing internet hosts as assets
+        for ext_ip, int_ip, port in ((dst, src, dport), (src, dst, sport)):
+            if kinds.get(ext_ip) == "external" and kinds.get(int_ip) == "internal":
+                e = external[ext_ip]
+                e["internal_peers"].add(int_ip)
+                if port is not None:
+                    e["ports"].add(port)
+                e["packets"] += 1
+                devices[int_ip].external_peers.add(f"{ext_ip}:{port}" if port is not None else ext_ip)
 
         matched_port = None
         for p in (dport, sport):
@@ -194,6 +256,8 @@ def analyze_pcap(path):
             # whichever side owns matched_port as its listening port is the "destination" role
             server_ip = dst if dport == matched_port else src
             client_ip = src if dport == matched_port else dst
+            if kinds.get(server_ip) != "internal" or kinds.get(client_ip) != "internal":
+                continue  # discovery broadcasts and internet traffic don't define OT roles
             devices[server_ip].protocols[proto_name] += 1
             devices[server_ip].ot_dest_count += 1
             devices[server_ip].peers.add(client_ip)
@@ -201,7 +265,13 @@ def analyze_pcap(path):
             devices[client_ip].ot_src_count += 1
             devices[client_ip].peers.add(server_ip)
 
-    return devices, l2_only
+    # A MAC that carried several IPs is a router/firewall interface, not the hosts behind it.
+    router_macs = {m for m, ips in mac_ips.items() if len(ips) > 1}
+    for ip, rec in devices.items():
+        rec.macs = {m for m in rec.macs if m.lower() not in router_macs}
+        if any(m.lower() in router_macs for m in mac_ips if ip in mac_ips[m]):
+            rec.routed = True
+    return devices, l2_only, dict(external)
 
 
 # ---------------------------------------------------------------------------
@@ -260,18 +330,21 @@ def analyze_nmap_xml(path):
 # Role classification
 # ---------------------------------------------------------------------------
 
-def classify_role(ot_ports_open, it_ports_open, ot_dest_count, ot_src_count):
-    if ot_ports_open and it_ports_open:
+def classify_role(ot_ports_open, host_it_ports_open, any_ports_open, ot_dest_count, ot_src_count, os_guess=None):
+    """Best-guess role. HTTP/HTTPS/SNMP/Telnet/FTP/SSH alone do NOT make a device "IT":
+    PLCs, RTUs and protocol gateways commonly run those management services themselves."""
+    windows = bool(os_guess) and "windows" in os_guess.lower()
+    it_host = host_it_ports_open or windows
+    serves_ot = ot_ports_open or ot_dest_count > 0
+    if serves_ot and it_host:
         return "Converged IT/OT Host"
-    if ot_ports_open:
-        return "Likely PLC / RTU / Field Device"
-    if ot_dest_count > 0 and ot_src_count == 0:
-        return "Likely PLC / RTU / Field Device"
-    if ot_src_count > 0 and ot_dest_count == 0:
+    if ot_src_count > 0 and ot_dest_count == 0 and not ot_ports_open:
         return "Likely Engineering Workstation / HMI"
-    if ot_src_count > 0 and ot_dest_count > 0:
+    if ot_src_count > 0 and serves_ot:
         return "Likely Engineering Workstation / HMI (also responds to OT traffic)"
-    if it_ports_open:
+    if serves_ot:
+        return "Likely PLC / RTU / Field Device"
+    if it_host or any_ports_open:
         return "IT-only Asset"
     return "Unclassified / Insufficient Data"
 
@@ -280,8 +353,9 @@ def classify_role(ot_ports_open, it_ports_open, ot_dest_count, ot_src_count):
 # Build the merged inventory
 # ---------------------------------------------------------------------------
 
-def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db):
+def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db, external=None):
     inventory = {}
+    external = external or {}
 
     for ip, rec in pcap_devices.items():
         mac = sorted(rec.macs)[0] if rec.macs else None
@@ -301,18 +375,20 @@ def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db):
             "distinct_peers": len(rec.peers),
             "ot_dest_count": rec.ot_dest_count,
             "ot_src_count": rec.ot_src_count,
+            "external_peers": sorted(rec.external_peers),
+            "routed": rec.routed,
         }
 
     for host in nmap_hosts:
         ip = host["ip"]
-        if ip is None:
+        if ip is None or ip_kind(ip) == "skip":
             continue
         entry = inventory.setdefault(ip, {
             "ip": ip, "mac": host.get("mac"), "all_macs_seen": [mac for mac in [host.get("mac")] if mac],
             "vendor": None, "os_guess": None, "nmap_mac_vendor": None, "open_ports": [],
             "protocols_observed": [], "protocol_packet_counts": {}, "packet_count": 0,
             "first_seen": None, "last_seen": None, "distinct_peers": 0,
-            "ot_dest_count": 0, "ot_src_count": 0,
+            "ot_dest_count": 0, "ot_src_count": 0, "external_peers": [], "routed": False,
         })
         if not entry.get("mac") and host.get("mac"):
             entry["mac"] = host["mac"]
@@ -326,20 +402,54 @@ def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db):
         if not entry.get("vendor") and host.get("nmap_mac_vendor"):
             entry["vendor"] = host["nmap_mac_vendor"]
 
+    # Layer-2 frames (GOOSE, PROFINET...) from a MAC that belongs to a known device are that device's
+    mac_to_ip = {}
+    for ip, entry in inventory.items():
+        for m in entry["all_macs_seen"]:
+            mac_to_ip[m.lower()] = ip
+    unmatched_l2 = {}
+    for mac, rec in l2_only_devices.items():
+        ip = mac_to_ip.get(mac.lower())
+        if ip:
+            e = inventory[ip]
+            for proto, n in rec.protocols.items():
+                e["protocol_packet_counts"][proto] = e["protocol_packet_counts"].get(proto, 0) + n
+            e["protocols_observed"] = sorted(set(e["protocols_observed"]) | set(rec.protocols))
+        else:
+            unmatched_l2[mac] = rec
+
     rows = []
     for ip, entry in inventory.items():
-        ot_ports_open = any(p["port"] in OT_PORTS for p in entry["open_ports"])
-        it_ports_open = any(p["port"] in IT_RISK_PORTS for p in entry["open_ports"])
-        role = classify_role(ot_ports_open, it_ports_open, entry["ot_dest_count"], entry["ot_src_count"])
+        ports = {p["port"] for p in entry["open_ports"]}
+        ot_ports_open = bool(ports & set(OT_PORTS))
+        host_it_ports_open = bool(ports & HOST_IT_PORTS)
+        role = classify_role(ot_ports_open, host_it_ports_open, bool(ports), entry["ot_dest_count"],
+                             entry["ot_src_count"], entry.get("os_guess"))
         entry["role"] = role
         entry["open_ports_display"] = ", ".join(
             f"{p['port']}/{p['service'] or '?'}" for p in entry["open_ports"]
         ) or None
         rows.append(entry)
 
-    # L2-only (no-IP) devices, kept in a separate list since they can't be merged by IP
+    # Notes: things an assessor should look at, per asset
+    ot_subnets = {subnet24(r["ip"]) for r in rows if r["role"].startswith("Likely PLC")}
+    for r in rows:
+        notes = []
+        if r["ot_src_count"] > 0 and ot_subnets and subnet24(r["ip"]) not in ot_subnets:
+            notes.append("Sends OT protocol traffic from outside the OT subnet(s)")
+        if r.get("external_peers"):
+            shown = ", ".join(r["external_peers"][:4]) + (" ..." if len(r["external_peers"]) > 4 else "")
+            notes.append(f"Talks to internet address(es): {shown}")
+        clear = sorted(CLEARTEXT_MGMT_PORTS[p["port"]] for p in r["open_ports"] if p["port"] in CLEARTEXT_MGMT_PORTS)
+        if clear and not r["role"].startswith("IT-only"):
+            notes.append("Cleartext management service(s) open: " + ", ".join(clear))
+        if r.get("routed") and not r.get("mac"):
+            notes.append("Seen only through a router, so its own MAC/vendor is not visible in this capture")
+        r["notes"] = notes
+
+    # L2-only (no-IP) devices that could not be matched to a known device
     l2_rows = []
-    for mac, rec in l2_only_devices.items():
+    for mac, rec in unmatched_l2.items():
         l2_rows.append({
             "mac": mac,
             "vendor": vendor_lookup(mac, oui_db),
@@ -349,39 +459,71 @@ def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db):
             "last_seen": iso_from_epoch(rec.last_seen),
         })
 
-    rows.sort(key=lambda r: (r["role"] != "Converged IT/OT Host", r["role"] != "Likely PLC / RTU / Field Device", r["ip"] or ""))
-    return rows, l2_rows
+    def ip_sort(ip):
+        try:
+            return ipaddress.ip_address(ip)
+        except ValueError:
+            return ipaddress.ip_address("0.0.0.0")
+    role_order = ["Converged IT/OT Host", "Likely PLC / RTU / Field Device"]
+    rows.sort(key=lambda r: (role_order.index(r["role"]) if r["role"] in role_order else 9, ip_sort(r["ip"])))
+
+    ext_rows = [{"external_ip": ip, "internal_peers": sorted(e["internal_peers"]),
+                 "ports": sorted(e["ports"]), "packets": e["packets"]} for ip, e in sorted(external.items())]
+    return rows, l2_rows, ext_rows
 
 
 # ---------------------------------------------------------------------------
 # Output rendering
 # ---------------------------------------------------------------------------
 
-def render_csv(rows, l2_rows, path):
-    with open(path, "w", newline="") as f:
+def flagged_by_priority(rows):
+    """Assets with notes, most important first: OT traffic from outside the OT subnet,
+    then internet contact, then cleartext management services."""
+    def rank(r):
+        text = " ".join(r.get("notes", []))
+        return (0 if "outside the OT subnet" in text else 1 if "internet" in text else 2, -len(r.get("notes", [])))
+    return sorted((r for r in rows if r.get("notes")), key=rank)
+
+
+def render_csv(rows, l2_rows, path, ext_rows=None):
+    """Main CSV holds one table only (sortable/filterable in Excel). Layer-2-only devices and
+    internet connections go to their own <prefix>_layer2.csv / <prefix>_external.csv files."""
+    written = [path]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "IP", "MAC", "Vendor", "Role", "OS Guess", "Open Ports", "Protocols Observed",
+            "IP", "MAC", "Vendor", "Role", "Notes", "OS Guess", "Open Ports", "Protocols Observed",
             "Packet Count", "Distinct Peers", "First Seen", "Last Seen"
         ])
         for r in rows:
             writer.writerow([
-                r["ip"], r["mac"] or "", r["vendor"] or "Unknown", r["role"], r["os_guess"] or "",
-                r["open_ports_display"] or "", "; ".join(r["protocols_observed"]),
+                r["ip"], r["mac"] or "", r["vendor"] or "Unknown", r["role"], "; ".join(r.get("notes", [])),
+                r["os_guess"] or "", r["open_ports_display"] or "", "; ".join(r["protocols_observed"]),
                 r["packet_count"], r["distinct_peers"], r["first_seen"] or "", r["last_seen"] or "",
             ])
-        if l2_rows:
-            writer.writerow([])
-            writer.writerow(["-- Layer 2 only devices (no IP address observed) --"])
+    base = path[:-4] if path.lower().endswith(".csv") else path
+    if l2_rows:
+        l2_path = base + "_layer2.csv"
+        with open(l2_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
             writer.writerow(["MAC", "Vendor", "Protocols Observed", "Packet Count", "First Seen", "Last Seen"])
             for r in l2_rows:
-                writer.writerow([
-                    r["mac"], r["vendor"] or "Unknown", "; ".join(r["protocols_observed"]),
-                    r["packet_count"], r["first_seen"] or "", r["last_seen"] or "",
-                ])
+                writer.writerow([r["mac"], r["vendor"] or "Unknown", "; ".join(r["protocols_observed"]),
+                                 r["packet_count"], r["first_seen"] or "", r["last_seen"] or ""])
+        written.append(l2_path)
+    if ext_rows:
+        ext_path = base + "_external.csv"
+        with open(ext_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Internet Address", "Internal Host(s)", "Ports", "Packets"])
+            for e in ext_rows:
+                writer.writerow([e["external_ip"], "; ".join(e["internal_peers"]),
+                                 ", ".join(str(p) for p in e["ports"]), e["packets"]])
+        written.append(ext_path)
+    return written
 
 
-def render_json(rows, l2_rows, pcap_path, nmap_path):
+def render_json(rows, l2_rows, pcap_path, nmap_path, ext_rows=None):
     out = {
         "generated": now_iso(),
         "inputs": {"pcap": pcap_path, "nmap_xml": nmap_path},
@@ -389,11 +531,12 @@ def render_json(rows, l2_rows, pcap_path, nmap_path):
         "by_role": dict(Counter(r["role"] for r in rows)),
         "assets": rows,
         "layer2_only_devices": l2_rows,
+        "internet_connections": ext_rows or [],
     }
     return json.dumps(out, indent=2, default=str)
 
 
-def render_markdown(rows, l2_rows, pcap_path, nmap_path):
+def render_markdown(rows, l2_rows, pcap_path, nmap_path, ext_rows=None):
     lines = []
     lines.append("# OT Asset Inventory")
     lines.append("")
@@ -436,16 +579,37 @@ def render_markdown(rows, l2_rows, pcap_path, nmap_path):
             lines.append(f"- {proto}: seen on {count} device(s)")
         lines.append("")
 
+    flagged = flagged_by_priority(rows)
+    if flagged:
+        lines.append("## Assets to Look At")
+        lines.append("")
+        for r in flagged:
+            lines.append(f"- **{r['ip']}** ({r['role']}): " + "; ".join(r["notes"]))
+        lines.append("")
+
     lines.append("## Asset Table")
     lines.append("")
-    lines.append("| IP | MAC | Vendor | Role | Open Ports | Protocols |")
-    lines.append("|----|-----|--------|------|------------|-----------|")
+    lines.append("| IP | MAC | Vendor | Role | Open Ports | Protocols | Notes |")
+    lines.append("|----|-----|--------|------|------------|-----------|-------|")
     for r in rows:
         lines.append(
             f"| {r['ip']} | {r['mac'] or '--'} | {r['vendor'] or 'Unknown'} | {r['role']} | "
-            f"{r['open_ports_display'] or '--'} | {', '.join(r['protocols_observed']) or '--'} |"
+            f"{r['open_ports_display'] or '--'} | {', '.join(r['protocols_observed']) or '--'} | "
+            f"{'; '.join(r.get('notes', [])) or '--'} |"
         )
     lines.append("")
+
+    if ext_rows:
+        lines.append("## Internet Connections (Not Assets)")
+        lines.append("")
+        lines.append("Public IP addresses that internal hosts talked to. They are listed here, not in the asset table.")
+        lines.append("")
+        lines.append("| Internet Address | Internal Host(s) | Ports | Packets |")
+        lines.append("|------------------|------------------|-------|---------|")
+        for e in ext_rows:
+            lines.append(f"| {e['external_ip']} | {', '.join(e['internal_peers'])} | "
+                         f"{', '.join(str(p) for p in e['ports']) or '--'} | {e['packets']} |")
+        lines.append("")
 
     if l2_rows:
         lines.append("## Layer 2 Only Devices (No IP Address Observed)")
@@ -459,7 +623,7 @@ def render_markdown(rows, l2_rows, pcap_path, nmap_path):
     return "\n".join(lines)
 
 
-def render_pdf(rows, l2_rows, pcap_path, nmap_path, path):
+def render_pdf(rows, l2_rows, pcap_path, nmap_path, path, ext_rows=None):
     if not HAVE_REPORTLAB:
         return False
     styles = getSampleStyleSheet()
@@ -482,10 +646,19 @@ def render_pdf(rows, l2_rows, pcap_path, nmap_path, path):
     story.append(summary_table)
     story.append(Spacer(1, 16))
 
+    flagged = flagged_by_priority(rows)
+    if flagged:
+        story.append(Paragraph("Assets to Look At", styles["Heading2"]))
+        for r in flagged:
+            story.append(Paragraph(f"<b>{r['ip']}</b> ({r['role']}): " + "; ".join(r["notes"]), styles["SmallBody"]))
+            story.append(Spacer(1, 3))
+        story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Asset Table", styles["Heading2"]))
     table_data = [["IP", "MAC", "Vendor", "Role", "Open Ports", "Protocols"]]
     for r in rows:
         table_data.append([
-            r["ip"] or "", r["mac"] or "--", r["vendor"] or "Unknown",
+            r["ip"] or "", r["mac"] or "--", Paragraph(r["vendor"] or "Unknown", styles["SmallBody"]),
             Paragraph(r["role"], styles["SmallBody"]),
             Paragraph(r["open_ports_display"] or "--", styles["SmallBody"]),
             Paragraph(", ".join(r["protocols_observed"]) or "--", styles["SmallBody"]),
@@ -501,6 +674,30 @@ def render_pdf(rows, l2_rows, pcap_path, nmap_path, path):
     ]))
     story.append(asset_table)
 
+    small_table_style = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ])
+    if ext_rows:
+        story += [Spacer(1, 14), Paragraph("Internet Connections (Not Assets)", styles["Heading2"])]
+        data = [["Internet Address", "Internal Host(s)", "Ports", "Packets"]] + [
+            [e["external_ip"], Paragraph(", ".join(e["internal_peers"]), styles["SmallBody"]),
+             ", ".join(str(p) for p in e["ports"]) or "--", str(e["packets"])] for e in ext_rows]
+        t = Table(data, colWidths=[1.6 * inch, 2.6 * inch, 1.6 * inch, 0.9 * inch], repeatRows=1)
+        t.setStyle(small_table_style)
+        story.append(t)
+    if l2_rows:
+        story += [Spacer(1, 14), Paragraph("Layer 2 Only Devices (No IP Address Observed)", styles["Heading2"])]
+        data = [["MAC", "Vendor", "Protocols", "Packets"]] + [
+            [r["mac"], Paragraph(r["vendor"] or "Unknown", styles["SmallBody"]),
+             Paragraph(", ".join(r["protocols_observed"]), styles["SmallBody"]), str(r["packet_count"])] for r in l2_rows]
+        t = Table(data, colWidths=[1.6 * inch, 2.6 * inch, 1.6 * inch, 0.9 * inch], repeatRows=1)
+        t.setStyle(small_table_style)
+        story.append(t)
+
     doc.build(story)
     return True
 
@@ -514,7 +711,7 @@ def main():
     parser.add_argument("--pcap", help="Path to a PCAP file (e.g. exported from Wireshark)")
     parser.add_argument("--nmap-xml", help="Path to Nmap XML output (nmap -oX)")
     parser.add_argument("--out-prefix", default="ot_asset_inventory", help="Output file prefix")
-    parser.add_argument("--oui-db", help="Path to an additional JSON file of MAC-prefix -> vendor entries to merge with the built-in seed database")
+    parser.add_argument("--oui-db", help="Path to an additional JSON file of MAC-prefix -> vendor entries to merge with the bundled IEEE database")
     parser.add_argument("--no-pdf", action="store_true", help="Skip PDF generation even if reportlab is installed")
     args = parser.parse_args()
 
@@ -523,11 +720,12 @@ def main():
 
     oui_db = load_oui_db(args.oui_db)
 
-    pcap_devices, l2_only = {}, {}
+    pcap_devices, l2_only, external = {}, {}, {}
     if args.pcap:
         print(f"[*] Analyzing PCAP: {args.pcap}")
-        pcap_devices, l2_only = analyze_pcap(args.pcap)
-        print(f"    -> {len(pcap_devices)} IP-addressed device(s), {len(l2_only)} layer-2-only device(s)")
+        pcap_devices, l2_only, external = analyze_pcap(args.pcap)
+        print(f"    -> {len(pcap_devices)} internal IP device(s), {len(l2_only)} layer-2-only MAC(s), "
+              f"{len(external)} internet address(es)")
 
     nmap_hosts = []
     if args.nmap_xml:
@@ -535,29 +733,34 @@ def main():
         nmap_hosts = analyze_nmap_xml(args.nmap_xml)
         print(f"    -> {len(nmap_hosts)} host(s) parsed")
 
-    rows, l2_rows = build_inventory(pcap_devices, l2_only, nmap_hosts, oui_db)
+    rows, l2_rows, ext_rows = build_inventory(pcap_devices, l2_only, nmap_hosts, oui_db, external)
+
+    out_dir = Path(args.out_prefix).parent
+    if str(out_dir) not in ("", "."):
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = f"{args.out_prefix}.csv"
     json_path = f"{args.out_prefix}.json"
     md_path = f"{args.out_prefix}.md"
     pdf_path = f"{args.out_prefix}.pdf"
 
-    render_csv(rows, l2_rows, csv_path)
-    with open(json_path, "w") as f:
-        f.write(render_json(rows, l2_rows, args.pcap, args.nmap_xml))
-    with open(md_path, "w") as f:
-        f.write(render_markdown(rows, l2_rows, args.pcap, args.nmap_xml))
+    csv_paths = render_csv(rows, l2_rows, csv_path, ext_rows)
+    with open(json_path, "w", encoding="utf-8") as f:
+        f.write(render_json(rows, l2_rows, args.pcap, args.nmap_xml, ext_rows))
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(render_markdown(rows, l2_rows, args.pcap, args.nmap_xml, ext_rows))
 
-    print(f"[*] Wrote {csv_path}, {json_path}, {md_path}")
+    print(f"[*] Wrote {', '.join(csv_paths)}, {json_path}, {md_path}")
 
     if not args.no_pdf:
         if HAVE_REPORTLAB:
-            render_pdf(rows, l2_rows, args.pcap, args.nmap_xml, pdf_path)
+            render_pdf(rows, l2_rows, args.pcap, args.nmap_xml, pdf_path, ext_rows)
             print(f"[*] Wrote {pdf_path}")
         else:
             print("[*] Skipped PDF -- install with: pip install reportlab --break-system-packages")
 
-    print(f"[*] {len(rows)} assets identified" + (f", {len(l2_rows)} layer-2-only devices" if l2_rows else ""))
+    print(f"[*] {len(rows)} assets identified" + (f", {len(l2_rows)} layer-2-only devices" if l2_rows else "")
+          + (f", {len(ext_rows)} internet address(es) contacted" if ext_rows else ""))
 
 
 if __name__ == "__main__":

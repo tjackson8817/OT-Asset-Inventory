@@ -1,0 +1,8 @@
+IP,MAC,Vendor,Role,OS Guess,Open Ports,Protocols Observed,Packet Count,Distinct Peers,First Seen,Last Seen
+10.0.1.10,00:1d:9c:aa:bb:cc,Rockwell Automation,Likely PLC / RTU / Field Device,Rockwell PLC,502/modbus,Modbus/TCP,3,1,2026-07-23T19:33:12Z,2026-07-23T19:33:12Z
+10.0.1.200,,Unknown,IT-only Asset,Linux server,22/ssh,,0,0,,
+10.0.1.50,20:a8:b9:11:22:33,Siemens AG,Likely Engineering Workstation / HMI,Windows 10,3389/ms-wbt-server,Modbus/TCP,3,1,2026-07-23T19:33:12Z,2026-07-23T19:33:12Z
+
+-- Layer 2 only devices (no IP address observed) --
+MAC,Vendor,Protocols Observed,Packet Count,First Seen,Last Seen
+00:00:54:44:55:66,Schneider Electric,IEC 61850 GOOSE,1,2026-07-23T19:33:12Z,2026-07-23T19:33:12Z

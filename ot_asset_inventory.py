@@ -100,6 +100,23 @@ ETHERTYPE_PROTOCOLS = {
 
 DEFAULT_OUI_DB_PATH = Path(__file__).parent / "oui_vendors.json"
 
+# Ports that identify the *service* side of a conversation (used to tell which end is the server)
+SERVICE_PORTS = set(range(1, 1024)) | {1433, 1521, 3306, 3389, 5432, 5900, 5938, 7070, 8080, 8443, 8530, 9443, 49320}
+
+
+def service_port(sport, dport):
+    """Return (port, server_is_dst) for a TCP/UDP conversation: the well-known/listening port and
+    which side owns it. Falls back to the lower port when neither side is obviously a service."""
+    if sport is None or dport is None:
+        return dport if dport is not None else sport, True
+    known_d = dport in OT_PORTS or dport in SERVICE_PORTS or dport in IT_RISK_PORTS
+    known_s = sport in OT_PORTS or sport in SERVICE_PORTS or sport in IT_RISK_PORTS
+    if known_d and not known_s:
+        return dport, True
+    if known_s and not known_d:
+        return sport, False
+    return (dport, True) if dport <= sport else (sport, False)
+
 
 def ip_kind(ip):
     """'internal', 'external', or 'skip' (broadcast, multicast, unspecified, invalid)."""
@@ -192,7 +209,8 @@ def is_group_mac(mac):
 def analyze_pcap(path):
     devices = defaultdict(DeviceRecord)   # keyed by internal IP
     l2_only = defaultdict(DeviceRecord)   # keyed by MAC, for non-IP ethertype protocols
-    external = defaultdict(lambda: {"internal_peers": set(), "ports": set(), "packets": 0})
+    external = defaultdict(lambda: {"internal_peers": set(), "ports": set(), "packets": 0,
+                                    "inbound": set(), "outbound": set()})
     mac_ips = defaultdict(set)            # MAC -> internal IPs it carried (more than one = router)
     packets = rdpcap(path)
 
@@ -236,14 +254,23 @@ def analyze_pcap(path):
             rec.touch(ts)
 
         # remember internet-facing conversations instead of listing internet hosts as assets
-        for ext_ip, int_ip, port in ((dst, src, dport), (src, dst, sport)):
+        for ext_ip, int_ip in ((dst, src), (src, dst)):
             if kinds.get(ext_ip) == "external" and kinds.get(int_ip) == "internal":
+                port, server_is_dst = service_port(sport, dport)
+                server = dst if server_is_dst else src
+                inbound = server == int_ip          # the internet host connected *to* our device
                 e = external[ext_ip]
                 e["internal_peers"].add(int_ip)
                 if port is not None:
                     e["ports"].add(port)
+                    (e["inbound"] if inbound else e["outbound"]).add(f"{int_ip}:{port}")
                 e["packets"] += 1
-                devices[int_ip].external_peers.add(f"{ext_ip}:{port}" if port is not None else ext_ip)
+                if port is None:
+                    devices[int_ip].external_peers.add(ext_ip)
+                elif inbound:
+                    devices[int_ip].external_peers.add(f"{ext_ip} -> this host's port {port} (inbound)")
+                else:
+                    devices[int_ip].external_peers.add(f"{ext_ip}:{port}")
 
         matched_port = None
         for p in (dport, sport):
@@ -433,13 +460,26 @@ def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db, external=
 
     # Notes: things an assessor should look at, per asset
     ot_subnets = {subnet24(r["ip"]) for r in rows if r["role"].startswith("Likely PLC")}
+    nmap_ips = {h["ip"] for h in nmap_hosts if h.get("ip")}
+    scanned_subnets = {subnet24(ip) for ip in nmap_ips}
     for r in rows:
         notes = []
+        if nmap_ips and r["ip"] not in nmap_ips and r["packet_count"] > 0:
+            ot = [p for p in r["protocols_observed"] if p not in ETHERTYPE_PROTOCOLS.values()]
+            if subnet24(r["ip"]) in scanned_subnets:
+                notes.append("Seen in traffic but did not answer the Nmap scan of its subnet: unmanaged, "
+                             "transient or rogue device?" + (f" Speaks {', '.join(ot)}." if ot else ""))
+            else:
+                notes.append("Seen in traffic, on a subnet the Nmap scan did not cover")
         if r["ot_src_count"] > 0 and ot_subnets and subnet24(r["ip"]) not in ot_subnets:
             notes.append("Sends OT protocol traffic from outside the OT subnet(s)")
         if r.get("external_peers"):
-            shown = ", ".join(r["external_peers"][:4]) + (" ..." if len(r["external_peers"]) > 4 else "")
-            notes.append(f"Talks to internet address(es): {shown}")
+            inb = [x for x in r["external_peers"] if x.endswith("(inbound)")]
+            outb = [x for x in r["external_peers"] if not x.endswith("(inbound)")]
+            if inb:
+                notes.append("Accepts connections from the internet: " + ", ".join(inb[:4]) + (" ..." if len(inb) > 4 else ""))
+            if outb:
+                notes.append("Talks to internet address(es): " + ", ".join(outb[:4]) + (" ..." if len(outb) > 4 else ""))
         clear = sorted(CLEARTEXT_MGMT_PORTS[p["port"]] for p in r["open_ports"] if p["port"] in CLEARTEXT_MGMT_PORTS)
         if clear and not r["role"].startswith("IT-only"):
             notes.append("Cleartext management service(s) open: " + ", ".join(clear))
@@ -468,7 +508,11 @@ def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db, external=
     rows.sort(key=lambda r: (role_order.index(r["role"]) if r["role"] in role_order else 9, ip_sort(r["ip"])))
 
     ext_rows = [{"external_ip": ip, "internal_peers": sorted(e["internal_peers"]),
-                 "ports": sorted(e["ports"]), "packets": e["packets"]} for ip, e in sorted(external.items())]
+                 "ports": sorted(e["ports"]), "packets": e["packets"],
+                 "direction": ("Inbound" if e["inbound"] and not e["outbound"] else
+                               "Both" if e["inbound"] else "Outbound"),
+                 "inbound_to": sorted(e["inbound"]), "outbound_to": sorted(e["outbound"])}
+                for ip, e in sorted(external.items())]
     return rows, l2_rows, ext_rows
 
 
@@ -477,11 +521,20 @@ def build_inventory(pcap_devices, l2_only_devices, nmap_hosts, oui_db, external=
 # ---------------------------------------------------------------------------
 
 def flagged_by_priority(rows):
-    """Assets with notes, most important first: OT traffic from outside the OT subnet,
-    then internet contact, then cleartext management services."""
+    """Assets with notes, most important first: devices the internet connects into and unscanned
+    devices speaking OT protocols, then other unscanned devices and OT traffic from outside the OT
+    subnet, then internet contact, then cleartext management services."""
     def rank(r):
         text = " ".join(r.get("notes", []))
-        return (0 if "outside the OT subnet" in text else 1 if "internet" in text else 2, -len(r.get("notes", [])))
+        if "Accepts connections from the internet" in text or ("did not answer the Nmap scan" in text and "Speaks" in text):
+            tier = 0
+        elif "did not answer the Nmap scan" in text or "outside the OT subnet" in text:
+            tier = 1
+        elif "internet" in text:
+            tier = 2
+        else:
+            tier = 3
+        return (tier, -len(r.get("notes", [])))
     return sorted((r for r in rows if r.get("notes")), key=rank)
 
 
@@ -515,10 +568,12 @@ def render_csv(rows, l2_rows, path, ext_rows=None):
         ext_path = base + "_external.csv"
         with open(ext_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(["Internet Address", "Internal Host(s)", "Ports", "Packets"])
+            writer.writerow(["Internet Address", "Direction", "Internal Host(s)", "Service Port(s)", "Packets",
+                             "Inbound (internal host:port reached from the internet)", "Outbound (internal host:remote port)"])
             for e in ext_rows:
-                writer.writerow([e["external_ip"], "; ".join(e["internal_peers"]),
-                                 ", ".join(str(p) for p in e["ports"]), e["packets"]])
+                writer.writerow([e["external_ip"], e.get("direction", ""), "; ".join(e["internal_peers"]),
+                                 ", ".join(str(p) for p in e["ports"]), e["packets"],
+                                 "; ".join(e.get("inbound_to", [])), "; ".join(e.get("outbound_to", []))])
         written.append(ext_path)
     return written
 
@@ -604,10 +659,10 @@ def render_markdown(rows, l2_rows, pcap_path, nmap_path, ext_rows=None):
         lines.append("")
         lines.append("Public IP addresses that internal hosts talked to. They are listed here, not in the asset table.")
         lines.append("")
-        lines.append("| Internet Address | Internal Host(s) | Ports | Packets |")
-        lines.append("|------------------|------------------|-------|---------|")
+        lines.append("| Internet Address | Direction | Internal Host(s) | Service Port(s) | Packets |")
+        lines.append("|------------------|-----------|------------------|-----------------|---------|")
         for e in ext_rows:
-            lines.append(f"| {e['external_ip']} | {', '.join(e['internal_peers'])} | "
+            lines.append(f"| {e['external_ip']} | {e.get('direction', '')} | {', '.join(e['internal_peers'])} | "
                          f"{', '.join(str(p) for p in e['ports']) or '--'} | {e['packets']} |")
         lines.append("")
 
@@ -683,10 +738,10 @@ def render_pdf(rows, l2_rows, pcap_path, nmap_path, path, ext_rows=None):
     ])
     if ext_rows:
         story += [Spacer(1, 14), Paragraph("Internet Connections (Not Assets)", styles["Heading2"])]
-        data = [["Internet Address", "Internal Host(s)", "Ports", "Packets"]] + [
-            [e["external_ip"], Paragraph(", ".join(e["internal_peers"]), styles["SmallBody"]),
+        data = [["Internet Address", "Direction", "Internal Host(s)", "Service Port(s)", "Packets"]] + [
+            [e["external_ip"], e.get("direction", ""), Paragraph(", ".join(e["internal_peers"]), styles["SmallBody"]),
              ", ".join(str(p) for p in e["ports"]) or "--", str(e["packets"])] for e in ext_rows]
-        t = Table(data, colWidths=[1.6 * inch, 2.6 * inch, 1.6 * inch, 0.9 * inch], repeatRows=1)
+        t = Table(data, colWidths=[1.4 * inch, 0.9 * inch, 2.3 * inch, 1.3 * inch, 0.8 * inch], repeatRows=1)
         t.setStyle(small_table_style)
         story.append(t)
     if l2_rows:

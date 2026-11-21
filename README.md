@@ -62,15 +62,31 @@ records, especially before using it to justify a network change.
 
 Each asset gets notes for things an assessor should check, and the
 Markdown/PDF list them under **Assets to Look At**, most important first:
+- **Accepts connections from the internet**: an internet address connected
+  *in* to this device, and on which port (e.g. a cellular modem's web admin)
+- **Seen in traffic but did not answer the Nmap scan**: an unmanaged,
+  transient or rogue device on a scanned subnet, with the OT protocols it
+  spoke. Devices on subnets the scan didn't cover are noted separately.
 - **Sends OT protocol traffic from outside the OT subnet(s)**: e.g. an
   IT-network laptop writing Modbus to a PLC
-- **Talks to internet address(es)**: the addresses and ports it contacted
+- **Talks to internet address(es)**: the addresses and service ports it
+  contacted
 - **Cleartext management service(s) open**: Telnet, FTP, HTTP or SNMP
 - **Seen only through a router**: its own MAC/vendor isn't in the capture
 
 Broadcast, multicast and internet addresses are not counted as assets.
 Internet addresses go to `<out-prefix>_external.csv` and an "Internet
-Connections" section instead.
+Connections" section instead. That table shows the **direction** (Inbound =
+the internet host connected to us, Outbound = our host connected out) and
+the **service port** of each conversation, not the client's random port.
+
+## What's new (November 2026)
+
+- Devices that appear in the capture but never answered the Nmap scan are
+  now flagged under Assets to Look At. They are the most likely rogue or
+  transient devices.
+- Internet connections now show direction and the real service port.
+  Inbound connections are flagged first.
 
 ## Vendor identification (MAC OUI lookup)
 
